@@ -1,7 +1,7 @@
 name: Weekly Snapshot
 on:
   schedule:
-    - cron: '0 6 * * 1'  # Monday 06:00 UTC
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 jobs:
   snapshot:
@@ -18,14 +18,13 @@ jobs:
           NEEDS_RESTART=false
           TOKEN=""
           
-          # Ensure server starts on ANY exit
           cleanup() {
             if $NEEDS_RESTART && [[ -n "$TOKEN" ]]; then
               echo "⚠ Cleanup: ensuring server is running..."
               for attempt in {1..3}; do
-                curl -sf -X PATCH "$API/servers/$SERVER_ID" \
+                curl -s -X PATCH "$API/servers/$SERVER_ID" \
                   -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
-                  -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' >/dev/null && break
+                  -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' && break
                 sleep 5
               done
               echo "✓ Server start command sent"
@@ -33,17 +32,32 @@ jobs:
           }
           trap cleanup EXIT
           
+          # Helper to make API calls with error visibility
+          api_call() {
+            local response http_code
+            response=$(curl -s -w "\n%{http_code}" "$@")
+            http_code=$(echo "$response" | tail -n1)
+            body=$(echo "$response" | sed '$d')
+            
+            if [[ "$http_code" -ge 400 ]]; then
+              echo "HTTP $http_code: $body" >&2
+              return 1
+            fi
+            echo "$body"
+          }
+          
           # Auth
-          TOKEN=$(curl -sf -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
-            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password" | jq -r '.access_token')
-          [[ -z "$TOKEN" || "$TOKEN" == "null" ]] && echo "✗ Auth failed" && exit 1
-          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json")
+          AUTH_RESPONSE=$(curl -s -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
+            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password")
+          TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.access_token')
+          [[ -z "$TOKEN" || "$TOKEN" == "null" ]] && echo "✗ Auth failed: $AUTH_RESPONSE" && exit 1
           echo "✓ Authenticated"
           
           wait_task() {
             local uuid=$1 max=${2:-60}
             for ((i=1; i<=max; i++)); do
-              state=$(curl -sf "$API/tasks/$uuid" "${AUTH[@]}" | jq -r '.state')
+              state=$(api_call "$API/tasks/$uuid" \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.state')
               case "$state" in
                 FINISHED) return 0 ;;
                 FAILED|CANCELLED) echo "Task $uuid: $state"; return 1 ;;
@@ -54,54 +68,58 @@ jobs:
           }
           
           # Check current state
-          STATE=$(curl -sf "$API/servers/$SERVER_ID" "${AUTH[@]}" | jq -r '.serverLiveInfo.state')
+          SERVER_INFO=$(api_call "$API/servers/$SERVER_ID" \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json") || exit 1
+          STATE=$(echo "$SERVER_INFO" | jq -r '.serverLiveInfo.state')
           echo "Current state: $STATE"
           
           # Shutdown if running
           if [[ "$STATE" != "OFF" && "$STATE" != "SHUTOFF" ]]; then
             NEEDS_RESTART=true
             echo "Stopping server..."
-            TASK=$(curl -sf -X PATCH "$API/servers/$SERVER_ID?stateOption=OFF:%20POWEROFF" "${AUTH[@]}" \
-              -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}' | jq -r '.uuid // empty')
             
-            if [[ -n "$TASK" ]]; then
-              wait_task "$TASK" 30 || true
-            fi
+            STOP_RESPONSE=$(api_call -X PATCH "$API/servers/$SERVER_ID" \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
+              -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}') || {
+              echo "✗ Stop request failed, trying with stateOption..."
+              STOP_RESPONSE=$(api_call -X PATCH "$API/servers/$SERVER_ID?stateOption=POWEROFF" \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
+                -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}') || exit 1
+            }
+            
+            TASK=$(echo "$STOP_RESPONSE" | jq -r '.uuid // empty')
+            [[ -n "$TASK" ]] && wait_task "$TASK" 30
             
             # Verify stopped
             for i in {1..30}; do
-              STATE=$(curl -sf "$API/servers/$SERVER_ID" "${AUTH[@]}" | jq -r '.serverLiveInfo.state')
+              STATE=$(api_call "$API/servers/$SERVER_ID" \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state')
               [[ "$STATE" == "OFF" || "$STATE" == "SHUTOFF" ]] && break
               sleep 10
             done
-            echo "✓ Server stopped"
+            echo "✓ Server stopped (state: $STATE)"
           fi
           
           # Create snapshot
           SNAP="weekly-$(date -u +%Y%m%d-%H%M)"
           echo "Creating snapshot: $SNAP"
-          RESULT=$(curl -sf -X POST "$API/servers/$SERVER_ID/snapshots" "${AUTH[@]}" \
+          SNAP_RESPONSE=$(api_call -X POST "$API/servers/$SERVER_ID/snapshots" \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}")
+            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}") || exit 1
           
-          TASK=$(echo "$RESULT" | jq -r '.uuid // empty')
-          if [[ -z "$TASK" ]]; then
-            echo "✗ Snapshot request failed: $RESULT"
-            exit 1
-          fi
+          TASK=$(echo "$SNAP_RESPONSE" | jq -r '.uuid // empty')
+          [[ -z "$TASK" ]] && echo "✗ No task UUID: $SNAP_RESPONSE" && exit 1
           
           echo "Snapshot task: $TASK"
-          if wait_task "$TASK" 120; then
-            echo "✓ Snapshot created: $SNAP"
-          else
-            echo "✗ Snapshot task failed"
-            exit 1
-          fi
+          wait_task "$TASK" 120 || exit 1
+          echo "✓ Snapshot created: $SNAP"
           
-          # Explicit restart (trap handles failures)
+          # Restart
           if $NEEDS_RESTART; then
-            curl -sf -X PATCH "$API/servers/$SERVER_ID" "${AUTH[@]}" \
+            api_call -X PATCH "$API/servers/$SERVER_ID" \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
               -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' >/dev/null
-            NEEDS_RESTART=false  # Prevent trap from restarting again
+            NEEDS_RESTART=false
             echo "✓ Server started"
           fi
