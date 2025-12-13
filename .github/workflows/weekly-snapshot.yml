@@ -112,7 +112,7 @@ jobs:
           SNAP_RESPONSE=$(api_call -X POST "$API/servers/$SERVER_ID/snapshots" \
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}") || exit 1
+            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly Backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}") || exit 1
           
           TASK=$(echo "$SNAP_RESPONSE" | jq -r '.uuid // empty')
           [[ -z "$TASK" ]] && echo "✗ No task UUID in response" && exit 1
