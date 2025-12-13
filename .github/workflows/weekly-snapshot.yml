@@ -15,39 +15,67 @@ jobs:
           SCP_PASS: ${{ secrets.SCP_PASS }}
           SERVER_ID: "652141"
         run: |
-          set -e
+          set -euo pipefail
           WEEK="kw$(date +%V)"
           
-          TOKEN=$(curl -sf -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
-            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password" | jq -r '.access_token')
+          echo "Authenticating..."
+          AUTH_RESPONSE=$(curl -s -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
+            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password")
+          
+          TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.access_token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "Auth failed. Response: $AUTH_RESPONSE"
+            exit 1
+          fi
+          echo "Auth OK"
           
           API="https://www.servercontrolpanel.de/scp-core/api/v1/servers/$SERVER_ID"
-          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json")
           
-          STATE=$(curl -sf "${AUTH[@]}" "$API" | jq -r '.serverLiveInfo.state')
+          echo "Getting server info..."
+          SERVER_RESPONSE=$(curl -s "$API" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/hal+json")
+          
+          STATE=$(echo "$SERVER_RESPONSE" | jq -r '.serverLiveInfo.state // empty')
+          if [ -z "$STATE" ]; then
+            echo "Failed to get state. Response: $SERVER_RESPONSE"
+            exit 1
+          fi
           echo "Current state: $STATE"
           
           if [ "$STATE" != "OFF" ] && [ "$STATE" != "SHUTOFF" ]; then
             echo "Stopping server..."
-            curl -sf -X PATCH "${AUTH[@]}" -H "Content-Type: application/merge-patch+json" \
-              "$API" -d '{"state":"OFF"}' > /dev/null
+            curl -s -X PATCH "$API" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/hal+json" \
+              -H "Content-Type: application/merge-patch+json" \
+              -d '{"state":"OFF"}'
             
             for i in {1..30}; do
               sleep 10
-              STATE=$(curl -sf "${AUTH[@]}" "$API" | jq -r '.serverLiveInfo.state')
+              STATE=$(curl -s "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state // empty')
               echo "State: $STATE"
               [ "$STATE" = "OFF" ] || [ "$STATE" = "SHUTOFF" ] && break
             done
+          else
+            echo "Server already stopped"
           fi
           
           echo "Creating snapshot: $WEEK"
-          curl -sf -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
-            "$API/snapshots" -d "{\"name\":\"$WEEK\",\"description\":\"Weekly backup\",\"onlineSnapshot\":false}"
+          SNAP_RESPONSE=$(curl -s -X POST "$API/snapshots" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/hal+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"$WEEK\",\"description\":\"Weekly backup\",\"onlineSnapshot\":false}")
+          echo "Snapshot response: $SNAP_RESPONSE"
           
           sleep 30
           
           echo "Starting server..."
-          curl -sf -X PATCH "${AUTH[@]}" -H "Content-Type: application/merge-patch+json" \
-            "$API" -d '{"state":"ON"}'
+          curl -s -X PATCH "$API" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/hal+json" \
+            -H "Content-Type: application/merge-patch+json" \
+            -d '{"state":"ON"}'
           
           echo "Done"
