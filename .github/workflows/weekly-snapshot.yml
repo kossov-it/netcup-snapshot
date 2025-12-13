@@ -2,8 +2,8 @@ name: Weekly Snapshot
 
 on:
   schedule:
-    - cron: '0 4 * * 0'  # Every Sunday 4:00 UTC
-  workflow_dispatch:      # Manual trigger
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
 
 jobs:
   snapshot:
@@ -18,18 +18,15 @@ jobs:
           set -e
           WEEK="kw$(date +%V)"
           
-          # Auth
           TOKEN=$(curl -sf -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
             -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password" | jq -r '.access_token')
           
           API="https://www.servercontrolpanel.de/scp-core/api/v1/servers/$SERVER_ID"
           AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json")
           
-          # Get current state
-          STATE=$(curl -sf "${AUTH[@]}" "$API" | jq -r '.state')
+          STATE=$(curl -sf "${AUTH[@]}" "$API" | jq -r '.serverLiveInfo.state')
           echo "Current state: $STATE"
           
-          # Shutdown if running
           if [ "$STATE" != "OFF" ] && [ "$STATE" != "SHUTOFF" ]; then
             echo "Stopping server..."
             curl -sf -X PATCH "${AUTH[@]}" -H "Content-Type: application/merge-patch+json" \
@@ -37,18 +34,16 @@ jobs:
             
             for i in {1..30}; do
               sleep 10
-              STATE=$(curl -sf "${AUTH[@]}" "$API" | jq -r '.state')
+              STATE=$(curl -sf "${AUTH[@]}" "$API" | jq -r '.serverLiveInfo.state')
               echo "State: $STATE"
               [ "$STATE" = "OFF" ] || [ "$STATE" = "SHUTOFF" ] && break
             done
           fi
           
-          # Create snapshot
           echo "Creating snapshot: $WEEK"
           curl -sf -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
             "$API/snapshots" -d "{\"name\":\"$WEEK\",\"description\":\"Weekly backup\",\"onlineSnapshot\":false}"
           
-          # Wait for snapshot to start, then boot
           sleep 30
           
           echo "Starting server..."
