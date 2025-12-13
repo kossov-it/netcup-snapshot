@@ -17,65 +17,36 @@ jobs:
         run: |
           set -euo pipefail
           WEEK="kw$(date +%V)"
-          
-          echo "Authenticating..."
-          AUTH_RESPONSE=$(curl -s -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
-            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password")
-          
-          TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.access_token // empty')
-          if [ -z "$TOKEN" ]; then
-            echo "Auth failed. Response: $AUTH_RESPONSE"
-            exit 1
-          fi
-          echo "Auth OK"
-          
           API="https://www.servercontrolpanel.de/scp-core/api/v1/servers/$SERVER_ID"
           
-          echo "Getting server info..."
-          SERVER_RESPONSE=$(curl -s "$API" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/hal+json")
+          TOKEN=$(curl -sf -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
+            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password" | jq -r '.access_token')
+          echo "✓ Authenticated"
           
-          STATE=$(echo "$SERVER_RESPONSE" | jq -r '.serverLiveInfo.state // empty')
-          if [ -z "$STATE" ]; then
-            echo "Failed to get state. Response: $SERVER_RESPONSE"
-            exit 1
-          fi
-          echo "Current state: $STATE"
+          STATE=$(curl -sf "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state')
+          echo "Server state: $STATE"
           
           if [ "$STATE" != "OFF" ] && [ "$STATE" != "SHUTOFF" ]; then
             echo "Stopping server..."
-            curl -s -X PATCH "$API" \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Accept: application/hal+json" \
-              -H "Content-Type: application/merge-patch+json" \
-              -d '{"state":"OFF"}'
+            curl -sf -X PATCH "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
+              -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}' > /dev/null
             
             for i in {1..30}; do
               sleep 10
-              STATE=$(curl -s "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state // empty')
-              echo "State: $STATE"
+              STATE=$(curl -sf "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state')
               [ "$STATE" = "OFF" ] || [ "$STATE" = "SHUTOFF" ] && break
             done
-          else
-            echo "Server already stopped"
+            echo "✓ Server stopped"
           fi
           
           echo "Creating snapshot: $WEEK"
-          SNAP_RESPONSE=$(curl -s -X POST "$API/snapshots" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/hal+json" \
-            -H "Content-Type: application/json" \
-            -d "{\"name\":\"$WEEK\",\"description\":\"Weekly backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}")
-          echo "Snapshot response: $SNAP_RESPONSE"
+          curl -sf -X POST "$API/snapshots" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
+            -H "Content-Type: application/json" -d "{\"name\":\"$WEEK\",\"description\":\"Weekly backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}" > /dev/null
+          echo "✓ Snapshot created"
           
           sleep 30
           
           echo "Starting server..."
-          curl -s -X PATCH "$API" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/hal+json" \
-            -H "Content-Type: application/merge-patch+json" \
-            -d '{"state":"ON"}'
-          
-          echo "Done"
+          curl -sf -X PATCH "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
+            -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' > /dev/null
+          echo "✓ Server started"
