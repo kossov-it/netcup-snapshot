@@ -8,45 +8,55 @@ on:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+    container: alpine:latest
     steps:
-      - name: Create weekly snapshot
+      - name: Setup
+        run: apk add --no-cache curl jq
+
+      - name: Create snapshot
         env:
           SCP_USER: ${{ secrets.SCP_USER }}
           SCP_PASS: ${{ secrets.SCP_PASS }}
           SERVER_ID: "652141"
         run: |
-          set -euo pipefail
-          WEEK="kw$(date +%V)"
+          set +e  # Don't exit on error - we must always try to start server
+          SNAP="$(date +%Y%m%d%H%M)"
           API="https://www.servercontrolpanel.de/scp-core/api/v1/servers/$SERVER_ID"
           
+          # Auth
           TOKEN=$(curl -sf -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
             -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password" | jq -r '.access_token')
+          [ -z "$TOKEN" ] && echo "✗ Auth failed" && exit 1
           echo "✓ Authenticated"
           
-          STATE=$(curl -sf "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state')
-          echo "Server state: $STATE"
+          auth() { curl -sf "$@" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json"; }
           
+          # Check state
+          STATE=$(auth "$API" | jq -r '.serverLiveInfo.state')
+          echo "State: $STATE"
+          
+          # Shutdown if needed
           if [ "$STATE" != "OFF" ] && [ "$STATE" != "SHUTOFF" ]; then
-            echo "Stopping server..."
-            curl -sf -X PATCH "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
-              -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}' > /dev/null
-            
-            for i in {1..30}; do
+            auth -X PATCH "$API" -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}' >/dev/null
+            for i in $(seq 1 30); do
               sleep 10
-              STATE=$(curl -sf "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state')
+              STATE=$(auth "$API" | jq -r '.serverLiveInfo.state')
               [ "$STATE" = "OFF" ] || [ "$STATE" = "SHUTOFF" ] && break
             done
-            echo "✓ Server stopped"
+            echo "✓ Stopped"
           fi
           
-          echo "Creating snapshot: $WEEK"
-          curl -sf -X POST "$API/snapshots" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
-            -H "Content-Type: application/json" -d "{\"name\":\"$WEEK\",\"description\":\"Weekly backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}" > /dev/null
-          echo "✓ Snapshot created"
+          # Snapshot
+          RESULT=$(auth -X POST "$API/snapshots" -H "Content-Type: application/json" \
+            -d "{\"name\":\"$SNAP\",\"description\":\"Auto\",\"diskName\":\"vda\",\"onlineSnapshot\":false}")
+          if echo "$RESULT" | jq -e '.uuid' >/dev/null 2>&1; then
+            echo "✓ Snapshot: $SNAP"
+          else
+            echo "✗ Snapshot failed: $(echo "$RESULT" | jq -r '.message // .errors[0].message // "unknown"')"
+          fi
           
           sleep 30
           
-          echo "Starting server..."
-          curl -sf -X PATCH "$API" -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
-            -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' > /dev/null
-          echo "✓ Server started"
+          # Always start server
+          auth -X PATCH "$API" -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' >/dev/null
+          echo "✓ Started"
