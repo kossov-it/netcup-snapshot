@@ -14,14 +14,14 @@ jobs:
           SCP_PASS: ${{ secrets.SCP_PASS }}
           SERVER_ID: "652141"
         run: |
-          set -uo pipefail
+          set -euo pipefail
           API="https://www.servercontrolpanel.de/scp-core/api/v1"
-          NEEDS_RESTART=false
+          WAS_ONLINE=false
           TOKEN=""
           
           cleanup() {
-            if $NEEDS_RESTART && [[ -n "$TOKEN" ]]; then
-              echo "⚠ Cleanup: ensuring server is running..."
+            if $WAS_ONLINE && [[ -n "$TOKEN" ]]; then
+              echo "⚠ Cleanup: restarting server..."
               for attempt in {1..5}; do
                 if curl -s -X PATCH "$API/servers/$SERVER_ID" \
                   -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
@@ -32,7 +32,7 @@ jobs:
                 echo "Retry $attempt/5..."
                 sleep 10
               done
-              echo "✗ Failed to send start command - CHECK SERVER MANUALLY"
+              echo "✗ Failed to restart - CHECK SERVER MANUALLY"
             fi
           }
           trap cleanup EXIT
@@ -43,18 +43,11 @@ jobs:
             http_code=$(echo "$response" | tail -n1)
             body=$(echo "$response" | sed '$d')
             if [[ "$http_code" -ge 400 ]]; then
-              echo "HTTP $http_code: $body" >&2
+              echo "API error (HTTP $http_code)" >&2
               return 1
             fi
             echo "$body"
           }
-          
-          # Auth
-          AUTH_RESPONSE=$(curl -s -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
-            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password")
-          TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.access_token // empty')
-          [[ -z "$TOKEN" ]] && echo "✗ Auth failed: $AUTH_RESPONSE" && exit 1
-          echo "✓ Authenticated"
           
           wait_task() {
             local uuid=$1 max=${2:-60}
@@ -66,7 +59,7 @@ jobs:
               case "$state" in
                 FINISHED) return 0 ;;
                 FAILED|CANCELLED) 
-                  echo "Task $state: $(echo "$task_response" | jq -r '.message // .responseError.message // "unknown"')"
+                  echo "Task $state"
                   return 1 ;;
                 "") echo "Invalid task response"; return 1 ;;
               esac
@@ -75,34 +68,45 @@ jobs:
             echo "Task timeout after $((max * 10))s"; return 1
           }
           
-          # Get server state
+          # Auth
+          AUTH_RESPONSE=$(curl -s -X POST 'https://servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
+            -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password")
+          TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.access_token // empty')
+          [[ -z "$TOKEN" ]] && echo "✗ Auth failed" && exit 1
+          echo "✓ Authenticated"
+          
+          # Check server state
           SERVER_INFO=$(api_call "$API/servers/$SERVER_ID" \
-            -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json") || exit 1
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json")
           STATE=$(echo "$SERVER_INFO" | jq -r '.serverLiveInfo.state // empty')
           [[ -z "$STATE" ]] && echo "✗ Could not determine server state" && exit 1
           echo "Current state: $STATE"
           
-          # Shutdown if not already off
-          if [[ "$STATE" != "OFF" && "$STATE" != "SHUTOFF" ]]; then
-            NEEDS_RESTART=true
+          # Handle based on state
+          if [[ "$STATE" == "OFF" || "$STATE" == "SHUTOFF" ]]; then
+            echo "✓ Server already offline"
+          else
+            WAS_ONLINE=true
             echo "Stopping server..."
             
             STOP_RESPONSE=$(api_call -X PATCH "$API/servers/$SERVER_ID" \
               -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
-              -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}') || exit 1
+              -H "Content-Type: application/merge-patch+json" -d '{"state":"OFF"}')
             
             TASK=$(echo "$STOP_RESPONSE" | jq -r '.uuid // empty')
             [[ -n "$TASK" ]] && { wait_task "$TASK" 30 || true; }
             
-            # Verify shutdown (wait up to 5 min)
+            # Wait for offline state
             for i in {1..30}; do
               STATE=$(api_call "$API/servers/$SERVER_ID" \
                 -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" | jq -r '.serverLiveInfo.state // empty')
-              [[ "$STATE" == "OFF" || "$STATE" == "SHUTOFF" ]] && break
-              [[ $i -eq 30 ]] && echo "✗ Server did not stop" && exit 1
+              if [[ "$STATE" == "OFF" || "$STATE" == "SHUTOFF" ]]; then
+                echo "✓ Server stopped"
+                break
+              fi
+              [[ $i -eq 30 ]] && echo "✗ Server did not stop in time" && exit 1
               sleep 10
             done
-            echo "✓ Server stopped"
           fi
           
           # Create snapshot
@@ -112,20 +116,20 @@ jobs:
           SNAP_RESPONSE=$(api_call -X POST "$API/servers/$SERVER_ID/snapshots" \
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly Backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}") || exit 1
+            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly Backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}")
           
           TASK=$(echo "$SNAP_RESPONSE" | jq -r '.uuid // empty')
           [[ -z "$TASK" ]] && echo "✗ No task UUID in response" && exit 1
           
           echo "Snapshot task: $TASK"
-          wait_task "$TASK" 180 || exit 1
+          wait_task "$TASK" 180
           echo "✓ Snapshot created: $SNAP"
           
-          # Restart server
-          if $NEEDS_RESTART; then
+          # Restart if was online
+          if $WAS_ONLINE; then
             api_call -X PATCH "$API/servers/$SERVER_ID" \
               -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
-              -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' >/dev/null || exit 1
-            NEEDS_RESTART=false
+              -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' >/dev/null
+            WAS_ONLINE=false
             echo "✓ Server started"
           fi
