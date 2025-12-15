@@ -6,7 +6,7 @@ on:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - name: Create offline snapshot
         env:
@@ -19,21 +19,28 @@ jobs:
           WAS_ONLINE=false
           TOKEN=""
           
-          cleanup() {
+          restart_server() {
             if $WAS_ONLINE && [[ -n "$TOKEN" ]]; then
-              echo "⚠ Cleanup: restarting server..."
+              echo "→ Restarting server..."
               for attempt in {1..5}; do
                 if curl -s -X PATCH "$API/servers/$SERVER_ID" \
                   -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
                   -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' | grep -q uuid; then
-                  echo "✓ Server start command sent"
+                  echo "✓ Server restart initiated"
+                  WAS_ONLINE=false
                   return 0
                 fi
                 echo "Retry $attempt/5..."
                 sleep 10
               done
-              echo "✗ Failed to restart - CHECK SERVER MANUALLY"
+              echo "✗ CRITICAL: Failed to restart - CHECK SERVER MANUALLY"
+              return 1
             fi
+            return 0
+          }
+          
+          cleanup() {
+            restart_server || true
           }
           trap cleanup EXIT
           
@@ -109,27 +116,34 @@ jobs:
             done
           fi
           
-          # Create snapshot
+          # Create snapshot (allow failure but ensure restart)
           SNAP="$(date -u +%Y%m%d)"
           echo "Creating snapshot: $SNAP"
           
-          SNAP_RESPONSE=$(api_call -X POST "$API/servers/$SERVER_ID/snapshots" \
+          SNAPSHOT_SUCCESS=false
+          if SNAP_RESPONSE=$(api_call -X POST "$API/servers/$SERVER_ID/snapshots" \
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly Backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}")
-          
-          TASK=$(echo "$SNAP_RESPONSE" | jq -r '.uuid // empty')
-          [[ -z "$TASK" ]] && echo "✗ No task UUID in response" && exit 1
-          
-          echo "Snapshot task: $TASK"
-          wait_task "$TASK" 180
-          echo "✓ Snapshot created: $SNAP"
-          
-          # Restart if was online
-          if $WAS_ONLINE; then
-            api_call -X PATCH "$API/servers/$SERVER_ID" \
-              -H "Authorization: Bearer $TOKEN" -H "Accept: application/hal+json" \
-              -H "Content-Type: application/merge-patch+json" -d '{"state":"ON"}' >/dev/null
-            WAS_ONLINE=false
-            echo "✓ Server started"
+            -d "{\"name\":\"$SNAP\",\"description\":\"Weekly Backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}"); then
+            
+            TASK=$(echo "$SNAP_RESPONSE" | jq -r '.uuid // empty')
+            if [[ -n "$TASK" ]]; then
+              echo "Snapshot task: $TASK"
+              if wait_task "$TASK" 180; then
+                echo "✓ Snapshot created: $SNAP"
+                SNAPSHOT_SUCCESS=true
+              else
+                echo "✗ Snapshot task failed"
+              fi
+            else
+              echo "✗ No task UUID in response"
+            fi
+          else
+            echo "✗ Snapshot creation failed"
           fi
+          
+          # Restart server (explicit, before trap)
+          restart_server
+          
+          # Exit with snapshot result
+          $SNAPSHOT_SUCCESS || exit 1
