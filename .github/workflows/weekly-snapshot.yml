@@ -7,12 +7,16 @@ jobs:
   snapshot:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:                                                                                   
+      fail-fast: false                                                                          
+      matrix:
+       server_id: ["652141", "826718"]
     steps:
       - name: Create offline snapshot
         env:
           SCP_USER: ${{ secrets.SCP_USER }}
           SCP_PASS: ${{ secrets.SCP_PASS }}
-          SERVER_ID: "652141"
+          SERVER_ID: ${{ matrix.server_id }}
         run: |
           set -euo pipefail
           API="https://www.servercontrolpanel.de/scp-core/api/v1"
