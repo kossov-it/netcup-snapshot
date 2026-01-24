@@ -10,7 +10,7 @@ jobs:
     strategy:                                                                                   
       fail-fast: false                                                                          
       matrix:
-       server_id: ["652141", "826718"]
+       server_id: ["652141", "826718", "829107"]
     steps:
       - name: Create offline snapshot
         env:
