@@ -270,6 +270,19 @@ jobs:
           echo "Current state: $STATE"
 
           # ─────────────────────────────────────────────────────────────
+          # Check for Existing Snapshot (skip if today's already exists)
+          # ─────────────────────────────────────────────────────────────
+          SNAP_NAME="$(date -u +%Y-%m-%d)"
+          EXISTING=$(api GET "/servers/$SERVER_ID/snapshots" 2>/dev/null \
+            | jq -r --arg name "$SNAP_NAME" '.[] | select(.name == $name) | .name // empty') || true
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "✓ Snapshot '$SNAP_NAME' already exists for server $SERVER_ID — skipping"
+            WAS_ONLINE=false
+            exit 0
+          fi
+
+          # ─────────────────────────────────────────────────────────────
           # Stop Server if Online
           # ─────────────────────────────────────────────────────────────
           if [[ "$STATE" != "OFF" && "$STATE" != "SHUTOFF" ]]; then
@@ -296,7 +309,6 @@ jobs:
           # ─────────────────────────────────────────────────────────────
           # Create Snapshot
           # ─────────────────────────────────────────────────────────────
-          SNAP_NAME="$(date -u +%Y-%m-%d)"
           echo "Creating snapshot: $SNAP_NAME"
 
           if ! SNAP_RESPONSE=$(api POST "/servers/$SERVER_ID/snapshots" \
