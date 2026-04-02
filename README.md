@@ -34,16 +34,16 @@ Go to **Settings > Secrets and variables > Actions > Variables** and create:
 
 | Variable | Value | Description |
 |----------|-------|-------------|
-| `SERVER_IDS` | `["652141", "826718"]` | JSON array of your netcup server IDs |
+| `SERVER_IDS` | `["123456", "789012"]` | JSON array of your netcup server IDs |
 
 The value must be a valid JSON array of strings. Examples:
 
 ```
-Single server:   ["652141"]
-Multiple:        ["652141", "826718", "829107"]
+Single server:   ["123456"]
+Multiple:        ["123456", "789012", "345678"]
 ```
 
-You can find your server IDs in the SCP URL when viewing a server (e.g. `servercontrolpanel.de/scp/servers/652141`), or via the API:
+You can find your server IDs in the SCP URL when viewing a server (e.g. `servercontrolpanel.de/scp/servers/123456`), or via the API:
 
 ```bash
 curl -s "$API_BASE/servers" -H "Authorization: Bearer $TOKEN" | jq '.[].serverId'
