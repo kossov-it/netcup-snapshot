@@ -1,0 +1,342 @@
+name: Weekly Snapshot
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        server_id: ${{ fromJson(vars.SERVER_IDS) }}
+
+    steps:
+      - name: Create offline snapshot
+        env:
+          SCP_USER: ${{ secrets.SCP_USER }}
+          SCP_PASS: ${{ secrets.SCP_PASS }}
+          SERVER_ID: ${{ matrix.server_id }}
+        run: |
+          set -euo pipefail
+
+          # ─────────────────────────────────────────────────────────────
+          # Configuration
+          # ─────────────────────────────────────────────────────────────
+          readonly API_BASE="https://www.servercontrolpanel.de/scp-core/api/v1"
+          readonly AUTH_URL="https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token"
+          readonly POLL_INTERVAL=5
+          readonly POLL_MAX_ATTEMPTS=12
+          readonly TASK_TIMEOUT_ATTEMPTS=30
+          readonly RESTART_MAX_ATTEMPTS=3
+          readonly SNAPSHOT_RETENTION_DAYS=28
+
+          WAS_ONLINE=false
+
+          echo "::group::Server $SERVER_ID"
+          echo "═══════════════════════════════════════════════════════════"
+          echo "Processing server: $SERVER_ID"
+          echo "═══════════════════════════════════════════════════════════"
+
+          # ─────────────────────────────────────────────────────────────
+          # Authentication
+          # ─────────────────────────────────────────────────────────────
+          refresh_token() {
+            local auth_response new_token
+            auth_response=$(curl -s --retry 3 --retry-delay 2 --retry-all-errors \
+              -X POST "$AUTH_URL" \
+              -d "client_id=scp&username=$SCP_USER&password=$SCP_PASS&grant_type=password")
+
+            new_token=$(echo "$auth_response" | jq -r '.access_token // empty')
+
+            if [[ -z "$new_token" || "$new_token" == "null" ]]; then
+              echo "::error title=Auth Failed::Authentication failed for server $SERVER_ID" >&2
+              echo "Authentication failed (check SCP_USER/SCP_PASS secrets)" >&2
+              return 1
+            fi
+
+            TOKEN="$new_token"
+            echo "::add-mask::$TOKEN"
+          }
+
+          refresh_token || exit 1
+          echo "✓ Authenticated"
+
+          # ─────────────────────────────────────────────────────────────
+          # API Helper Function
+          # ─────────────────────────────────────────────────────────────
+          api() {
+            local method=$1
+            local endpoint=$2
+            shift 2
+
+            local response http_code
+            response=$(curl -s --retry 2 --retry-delay 2 --retry-all-errors \
+              -w "\n%{http_code}" \
+              -X "$method" \
+              "$API_BASE$endpoint" \
+              -H "Authorization: Bearer $TOKEN" \
+              "$@")
+
+            http_code=$(echo "$response" | tail -n1)
+            response=$(echo "$response" | sed '$d')
+
+            if [[ ! "$http_code" =~ ^2[0-9]{2}$ ]]; then
+              echo "::warning::API $method $endpoint returned HTTP $http_code" >&2
+              echo "$response" >&2
+              return 1
+            fi
+
+            echo "$response"
+          }
+
+          # ─────────────────────────────────────────────────────────────
+          # Wait for Task Completion
+          # ─────────────────────────────────────────────────────────────
+          wait_task() {
+            local uuid=$1
+            local max_attempts=${2:-$TASK_TIMEOUT_ATTEMPTS}
+            local state poll_failures=0
+
+            for ((i = 1; i <= max_attempts; i++)); do
+              state=$(api GET "/tasks/$uuid" 2>/dev/null | jq -r '.state // empty') || true
+
+              case "$state" in
+                FINISHED)
+                  return 0
+                  ;;
+                ERROR|CANCELED|WAITING_FOR_CANCEL|ROLLBACK)
+                  echo "::warning::Task $uuid ended with state: $state"
+                  return 1
+                  ;;
+                "")
+                  poll_failures=$((poll_failures + 1))
+                  if ((poll_failures >= 3)); then
+                    echo "::warning::Could not retrieve task state for $uuid after $poll_failures consecutive failures"
+                    return 1
+                  fi
+                  ;;
+                *)
+                  poll_failures=0
+                  ;;
+              esac
+              sleep "$POLL_INTERVAL"
+            done
+
+            echo "::warning::Task $uuid timed out after $((max_attempts * POLL_INTERVAL))s"
+            return 1
+          }
+
+          # ─────────────────────────────────────────────────────────────
+          # Wait for Server State
+          # ─────────────────────────────────────────────────────────────
+          wait_for_state() {
+            local target_states=("$@")
+            local state
+
+            for ((i = 1; i <= POLL_MAX_ATTEMPTS; i++)); do
+              state=$(api GET "/servers/$SERVER_ID" 2>/dev/null | jq -r '.serverLiveInfo.state // empty') || true
+
+              for target in "${target_states[@]}"; do
+                if [[ "$state" == "$target" ]]; then
+                  return 0
+                fi
+              done
+              sleep "$POLL_INTERVAL"
+            done
+            return 1
+          }
+
+          # ─────────────────────────────────────────────────────────────
+          # Cleanup Old Snapshots
+          # ─────────────────────────────────────────────────────────────
+          cleanup_old_snapshots() {
+            echo "→ Cleaning up snapshots older than ${SNAPSHOT_RETENTION_DAYS} days..."
+
+            local snapshots
+            snapshots=$(api GET "/servers/$SERVER_ID/snapshots" 2>/dev/null) || {
+              echo "::warning::Could not list snapshots for cleanup"
+              return 0
+            }
+
+            local cutoff_epoch
+            cutoff_epoch=$(date -u -d "-${SNAPSHOT_RETENTION_DAYS} days" +%s)
+
+            local names
+            names=$(echo "$snapshots" | jq -r '.[].name // empty')
+
+            local deleted=0
+            while IFS= read -r snap_name; do
+              [[ -z "$snap_name" ]] && continue
+
+              # Try to parse as ISO 8601 (YYYY-MM-DD)
+              local snap_epoch=""
+              if [[ "$snap_name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+                snap_epoch=$(date -u -d "$snap_name" +%s 2>/dev/null) || true
+              # Try legacy ddmmyy format
+              elif [[ "$snap_name" =~ ^[0-9]{6}$ ]]; then
+                local dd="${snap_name:0:2}" mm="${snap_name:2:2}" yy="${snap_name:4:2}"
+                snap_epoch=$(date -u -d "20${yy}-${mm}-${dd}" +%s 2>/dev/null) || true
+              fi
+
+              # Skip snapshots we can't parse (don't delete what we don't understand)
+              if [[ -z "$snap_epoch" ]]; then
+                echo "  Skipping unrecognized snapshot: $snap_name"
+                continue
+              fi
+
+              # Skip if within retention window
+              if (( snap_epoch >= cutoff_epoch )); then
+                echo "  Keeping snapshot: $snap_name"
+                continue
+              fi
+
+              echo "  Deleting old snapshot: $snap_name"
+              local del_task
+              del_task=$(api DELETE "/servers/$SERVER_ID/snapshots/$snap_name" 2>/dev/null | jq -r '.uuid // empty') || true
+
+              if [[ -n "$del_task" ]]; then
+                if wait_task "$del_task" 12; then
+                  echo "  ✓ Deleted: $snap_name"
+                  deleted=$((deleted + 1))
+                else
+                  echo "::warning::Delete task for snapshot $snap_name did not complete"
+                fi
+              else
+                echo "::warning::No task UUID returned when deleting snapshot $snap_name"
+              fi
+            done <<< "$names"
+
+            echo "✓ Cleanup complete ($deleted old snapshot(s) deleted)"
+          }
+
+          # ─────────────────────────────────────────────────────────────
+          # Restart Server (called by trap on exit)
+          # ─────────────────────────────────────────────────────────────
+          restart_server() {
+            if ! $WAS_ONLINE; then
+              return 0
+            fi
+
+            echo "→ Restarting server $SERVER_ID..."
+
+            # Re-authenticate in case token expired during snapshot
+            refresh_token || true
+
+            local task attempt
+            for ((attempt = 1; attempt <= RESTART_MAX_ATTEMPTS; attempt++)); do
+              echo "  Restart attempt $attempt/$RESTART_MAX_ATTEMPTS"
+
+              task=$(api PATCH "/servers/$SERVER_ID" \
+                -H "Content-Type: application/merge-patch+json" \
+                -d '{"state":"ON"}' 2>/dev/null | jq -r '.uuid // empty') || true
+
+              if [[ -z "$task" ]]; then
+                sleep "$POLL_INTERVAL"
+                continue
+              fi
+
+              if wait_task "$task" 12; then
+                break
+              fi
+            done
+
+            # Verify server is online
+            if wait_for_state "RUNNING"; then
+              echo "✓ Server $SERVER_ID is online"
+              WAS_ONLINE=false
+              return 0
+            fi
+
+            echo "::error title=Server Offline::CRITICAL: Server $SERVER_ID not verified online - CHECK MANUALLY"
+            return 1
+          }
+
+          trap 'restart_server || true; echo "::endgroup::"' EXIT
+
+          # ─────────────────────────────────────────────────────────────
+          # Get Current Server State
+          # ─────────────────────────────────────────────────────────────
+          SERVER_RESPONSE=$(api GET "/servers/$SERVER_ID")
+          STATE=$(echo "$SERVER_RESPONSE" | jq -r '.serverLiveInfo.state // empty')
+
+          if [[ -z "$STATE" ]]; then
+            echo "::error title=State Unknown::Could not determine server state for $SERVER_ID"
+            exit 1
+          fi
+
+          echo "Current state: $STATE"
+
+          # ─────────────────────────────────────────────────────────────
+          # Check for Existing Snapshot (skip if today's already exists)
+          # ─────────────────────────────────────────────────────────────
+          SNAP_NAME="$(date -u +%Y-%m-%d)"
+          EXISTING=$(api GET "/servers/$SERVER_ID/snapshots" 2>/dev/null \
+            | jq -r --arg name "$SNAP_NAME" '.[] | select(.name == $name) | .name // empty') || true
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "✓ Snapshot '$SNAP_NAME' already exists for server $SERVER_ID — skipping"
+            WAS_ONLINE=false
+            exit 0
+          fi
+
+          # ─────────────────────────────────────────────────────────────
+          # Stop Server if Online
+          # ─────────────────────────────────────────────────────────────
+          if [[ "$STATE" != "OFF" && "$STATE" != "SHUTOFF" ]]; then
+            WAS_ONLINE=true
+            echo "Stopping server..."
+
+            TASK=$(api PATCH "/servers/$SERVER_ID" \
+              -H "Content-Type: application/merge-patch+json" \
+              -d '{"state":"OFF"}' | jq -r '.uuid // empty') || true
+
+            if [[ -n "$TASK" ]]; then
+              wait_task "$TASK" 12 || true
+            fi
+
+            # Wait for server to fully stop
+            if wait_for_state "OFF" "SHUTOFF"; then
+              echo "✓ Server stopped"
+            else
+              echo "::error title=Stop Failed::Server $SERVER_ID did not stop within timeout"
+              exit 1
+            fi
+          fi
+
+          # ─────────────────────────────────────────────────────────────
+          # Create Snapshot
+          # ─────────────────────────────────────────────────────────────
+          echo "Creating snapshot: $SNAP_NAME"
+
+          if ! SNAP_RESPONSE=$(api POST "/servers/$SERVER_ID/snapshots" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"$SNAP_NAME\",\"description\":\"Weekly Backup\",\"diskName\":\"vda\",\"onlineSnapshot\":false}"); then
+            echo "::error title=Snapshot Failed::Snapshot API call failed for server $SERVER_ID"
+            exit 1
+          fi
+
+          TASK=$(echo "$SNAP_RESPONSE" | jq -r '.uuid // empty')
+
+          if [[ -z "$TASK" ]]; then
+            echo "::error title=Snapshot Failed::No task UUID in response: $SNAP_RESPONSE"
+            exit 1
+          fi
+
+          echo "Snapshot task: $TASK"
+
+          if wait_task "$TASK" "$TASK_TIMEOUT_ATTEMPTS"; then
+            echo "✓ Snapshot created successfully: $SNAP_NAME"
+          else
+            echo "::error title=Snapshot Failed::Snapshot task did not complete for server $SERVER_ID"
+            exit 1
+          fi
+
+          # ─────────────────────────────────────────────────────────────
+          # Cleanup Old Snapshots (while server is still stopped)
+          # ─────────────────────────────────────────────────────────────
+          refresh_token || true
+          cleanup_old_snapshots
+
