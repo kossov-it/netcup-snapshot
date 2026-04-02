@@ -325,5 +325,6 @@ jobs:
           # ─────────────────────────────────────────────────────────────
           # Cleanup Old Snapshots (while server is still stopped)
           # ─────────────────────────────────────────────────────────────
+          refresh_token || true
           cleanup_old_snapshots
 
