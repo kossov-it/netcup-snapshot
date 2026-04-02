@@ -8,7 +8,7 @@ Every Monday at 04:00 UTC, the workflow runs for each configured server:
 
 1. Checks if today's snapshot already exists (skips if so — no downtime)
 2. Stops the server (if running)
-3. Creates an offline snapshot named by date (e.g. `2026-04-02`)
+3. Creates an offline snapshot named by date (e.g. `20260402`)
 4. Deletes snapshots older than 28 days
 5. Restarts the server
 
