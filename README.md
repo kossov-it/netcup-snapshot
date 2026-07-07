@@ -18,7 +18,7 @@ An `EXIT` trap (with `TERM`/`INT` routed in) always attempts a restart, even on 
 
 ## Setup
 
-**Secrets** (`Settings → Secrets and variables → Actions`): `SCP_USER`, `SCP_PASS` — your servercontrolpanel.de login. No API key.
+**Secrets** (`Settings → Secrets and variables → Actions`): `SCP_USER`, `SCP_PASS` — your SCP username and password. The workflow sends them as an OAuth2 password grant (`client_id=scp`, `grant_type=password`) to the SCP Keycloak token endpoint and uses the returned bearer token. No API key. (This is distinct from the CCP auto-login you use in a browser.)
 
 **Variable** — one required: `SERVER_IDS`, a JSON array of strings like `["123456", "789012"]` (ID is in the SCP URL).
 
