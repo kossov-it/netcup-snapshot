@@ -1,77 +1,47 @@
 # netcup Snapshot Automation
 
-Automated weekly offline snapshots for [netcup](https://www.netcup.de/) vServers via the [SCP REST API](https://www.netcup.com/en/helpcenter/documentation/server/rest-api) and GitHub Actions.
+Weekly offline snapshots for [netcup](https://www.netcup.de/) vServers via the [SCP REST API](https://www.netcup.com/en/helpcenter/documentation/server/rest-api) and GitHub Actions.
 
 ## How it works
 
-Every Monday at 04:00 UTC, for each server in `SERVER_IDS`:
+Every Monday 04:00 UTC, per server in `SERVER_IDS`, in parallel:
 
-1. Skip if today’s snapshot already exists (no downtime).
-1. Resolve the disk name and read the current power state.
-1. Gracefully stop the server (ACPI `OFF`) if running — the API requires `SHUTOFF` for an offline snapshot.
-1. Create an offline snapshot named `YYYYMMDD`.
-1. Delete this script’s own snapshots older than `SNAPSHOT_RETENTION_DAYS`.
-1. Restart the server.
+1. Skip if today’s `YYYYMMDD` snapshot exists — no downtime.
+1. Resolve disk (first only; warns on multi-disk), read power state.
+1. Gracefully stop (ACPI `OFF`) if running — offline snapshots need `SHUTOFF`.
+1. Prune our dated snapshots to the newest `SNAPSHOT_KEEP − 1` (the new one makes `KEEP`).
+1. Dry-run: **possible** → go; **out of space** → run storage optimization if enabled (**deletes all snapshots**; data/OS safe), else fail; **blocked** → fail; **inconclusive** → try anyway.
+1. Create snapshot `YYYYMMDD`.
+1. Restart — only if it was running at the start.
 
-Servers run in parallel. An `EXIT` trap — with `TERM`/`INT` routed into it — guarantees a restart attempt even on failure, cancellation, or timeout. Per-server `concurrency` stops overlapping runs from racing.
-
-**Transient write locks.** netcup serializes writes per server: a write issued while a previous state change or snapshot is still settling is rejected with **409** (undocumented runtime guard) or **503** (documented maintenance). The write never started, so every state-changing call retries through both until it serializes or `LOCK_RETRY_DEADLINE` is hit. The workflow comments carry the full rationale and the enum/state details, all verified against the live spec (`GET /scp-core/api/v1/openapi`).
+An `EXIT` trap (with `TERM`/`INT` routed in) always attempts a restart, even on failure/cancel/timeout. Per-server `concurrency` prevents overlapping runs. State-changing writes retry through netcup’s transient **409/503** locks until they serialize or `LOCK_RETRY_DEADLINE`.
 
 ## Setup
 
-### 1. Secrets — *Settings → Secrets and variables → Actions → Secrets*
+**Secrets** (`Settings → Secrets and variables → Actions`): `SCP_USER`, `SCP_PASS` — your servercontrolpanel.de login. No API key.
 
-|Secret    |Description       |
-|----------|------------------|
-|`SCP_USER`|SCP login username|
-|`SCP_PASS`|SCP login password|
+**Variable** — one required: `SERVER_IDS`, a JSON array of strings like `["123456", "789012"]` (ID is in the SCP URL).
 
-Same credentials as [servercontrolpanel.de](https://www.servercontrolpanel.de) — no API key needed.
+**Schedule** (optional): edit the cron, default `0 4 * * 1`. Also runs manually from the Actions tab.
 
-### 2. Server IDs — *… → Variables*
+## Overrides (optional)
 
-|Variable    |Example               |
-|------------|----------------------|
-|`SERVER_IDS`|`["123456", "789012"]`|
+Create these repo Variables only to override the defaults already in the workflow:
 
-A JSON array of strings. Find each ID in the SCP URL (`.../servers/123456`).
+|Variable                     |Default|Effect                                     |
+|-----------------------------|-------|-------------------------------------------|
+|`SNAPSHOT_KEEP`              |`3`    |Dated snapshots to retain (count-based)    |
+|`ENABLE_STORAGE_OPTIMIZATION`|`true` |Allow the destructive out-of-space fallback|
 
-### 3. Schedule (optional)
+Everything else is a `readonly` constant in the workflow: `POLL_INTERVAL` 5 s, `POLL_ATTEMPTS` 12 (~60 s), `SNAPSHOT_POLL_ATTEMPTS` 24 (~120 s), `OPT_POLL_ATTEMPTS` 240 (~20 min ceiling), `RESTART_MAX_ATTEMPTS` 3, `LOCK_RETRY_INTERVAL` 10 s, `LOCK_RETRY_DEADLINE` 180 s, `TOKEN_REFRESH_SECS` 240 s. Worst case ≈ the 20 min optimization ceiling → `timeout-minutes: 30`; raise both together.
 
-```yaml
-schedule:
-  - cron: '0 4 * * 1'   # Mon 04:00 UTC (default)
-```
+## Safety
 
-e.g. `0 3 * * 0` (Sun 03:00), `0 2 * * 1,4` (Mon+Thu 02:00), `0 4 * * *` (daily). Also runnable manually from the Actions tab.
-
-### 4. Tuning (optional)
-
-|Constant                 |Default|Description                                       |
-|-------------------------|-------|--------------------------------------------------|
-|`SNAPSHOT_RETENTION_DAYS`|`28`   |Delete snapshots older than this                  |
-|`POLL_INTERVAL`          |`5`    |Seconds between status polls                      |
-|`POLL_ATTEMPTS`          |`12`   |Max polls for state checks / short tasks (~60 s)  |
-|`SNAPSHOT_POLL_ATTEMPTS` |`30`   |Max polls for the snapshot task (~150 s)          |
-|`RESTART_MAX_ATTEMPTS`   |`3`    |Restart retries in the recovery trap              |
-|`LOCK_RETRY_INTERVAL`    |`10`   |Seconds between 409/503 write retries             |
-|`LOCK_RETRY_DEADLINE`    |`180`  |Max seconds to wait out a write lock / maintenance|
-
-The per-server worst case (three write deadlines plus the poll budgets) sits under `timeout-minutes: 25`. If you raise `LOCK_RETRY_DEADLINE`, raise `timeout-minutes` to match — the restart trap only runs if the runner isn’t killed first.
-
-## Safety & security
-
-- **Always restarts.** `EXIT` trap restarts on any failure; `TERM`/`INT` route into it so cancellation/timeout still attempts a restart. A failed restart exits non-zero, so the job goes red instead of silently green.
-- **No needless downtime.** Skips when today’s snapshot exists; never powers on a server that was already off.
-- **Transient-safe.** Writes retry through 409/503; only idempotent `GET`s are retried at the transport layer, so a write is never blindly re-sent.
-- **Conservative cleanup.** Deletes only snapshots named `YYYYMMDD`/`YYYY-MM-DD` older than retention, by the API’s `creationTime` — manual snapshots are preserved.
-- **Token refresh** before each long-running step, in case the access token expired.
-- **Hardened.** Secrets in encrypted GitHub Secrets, IDs in a Variable, URL-encoded auth body, tokens masked via `::add-mask::`, only a single `message` line logged (no raw bodies), `permissions: {}` and no checkout step.
-
-## Optional (not enabled)
-
-- **Pre-stop dry run** (`POST …/snapshots:dryrun`) — could catch a structurally impossible snapshot before stopping, but isn’t confirmed safe to trust against a *running* server.
-- **Forced power-off** (`PATCH …?stateOption=POWEROFF`) — defeats the point of a consistent snapshot; prefer investigating a guest that won’t halt cleanly.
+- **Always restarts**, even on failure/cancel/timeout; a failed restart fails the job (red, not silent green).
+- **No needless downtime** — skips if today’s snapshot exists; never powers on a server that was off.
+- **Cleanup keeps the newest `SNAPSHOT_KEEP`** dated (`YYYYMMDD`/`YYYY-MM-DD`) snapshots by `creationTime`; manual snapshots untouched.
+- **Destructive fallback is opt-out** — optimization wipes all snapshots, only on out-of-space + `ENABLE_STORAGE_OPTIMIZATION≠false`.
+- **Hardened** — encrypted secrets, masked tokens, URL-encoded auth, minimal logging, `permissions: {}`, no checkout. Only idempotent `GET`s retry at the transport layer.
 
 ## License
 
