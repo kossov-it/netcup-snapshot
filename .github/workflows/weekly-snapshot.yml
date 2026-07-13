@@ -234,6 +234,7 @@ jobs:
             refresh_token || echo "::warning::token refresh before optimization failed; continuing"
             local task
             task=$(api_locked POST "/servers/$SERVER_ID/storageoptimization?startAfterOptimization=false" \
+              -H "Content-Type: application/json" \
               | jq -r '.uuid // empty') || task=""
             if [[ -z "$task" ]]; then
               echo "::error title=Optimization Failed::Storage optimization did not start on $SERVER_ID"; return 1
