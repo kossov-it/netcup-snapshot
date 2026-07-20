@@ -23,8 +23,6 @@ jobs:
       - name: Create offline snapshot
         env:
           SCP_REFRESH_TOKEN: ${{ secrets.SCP_REFRESH_TOKEN }}
-          SCP_USER: ${{ secrets.SCP_USER }}
-          SCP_PASS: ${{ secrets.SCP_PASS }}
           SERVER_ID: ${{ matrix.server_id }}
           SNAPSHOT_KEEP: ${{ vars.SNAPSHOT_KEEP || '3' }}
           ENABLE_STORAGE_OPTIMIZATION: ${{ vars.ENABLE_STORAGE_OPTIMIZATION || 'true' }}
@@ -61,15 +59,325 @@ jobs:
           echo "::group::Server $SERVER_ID"
 
           # ── Authentication ─────────────────────────────────────────────
-          # Preferred: exchange the long-lived offline refresh token for a
-          # short-lived access token (the only flow in netcup's current API
-          # docs; the offline token stays valid while used every <=30 days,
-          # which the weekly schedule guarantees). Fallback: the old
-          # password grant, which netcup dropped from the docs and appears
-          # to have disabled server-side around 2026-07-20 - kept only so
-          # existing setups fail with a clear pointer to the new secret.
-          # Fields are URL-encoded so tokens/passwords with special
-          # characters are safe.
+          # Exchange the long-lived offline refresh token for a short-lived
+          # (~300s) access token - netcup's only documented API auth flow.
+          # The offline token stays valid while used at least every 30 days,
+          # which the weekly schedule guarantees. The refresh_token field is
+          # URL-encoded so a token with special characters is safe.
+          refresh_token() {
+            local response http_code body token detail
+            response=$(curl -s --retry 3 --retry-delay 2 --retry-all-errors \
+              -w "\n%{http_code}" \
+              -X POST "$AUTH_URL" \
+              --data-urlencode "client_id=scp" \
+              --data-urlencode "grant_type=refresh_token" \
+              --data-urlencode "refresh_token=$SCP_REFRESH_TOKEN") || response=""
+            http_code=$(printf '%s' "$response" | tail -n1)
+            body=$(printf '%s' "$response" | sed '$d')
+            token=$(printf '%s' "$body" | jq -r '.access_token // empty' 2>/dev/null) || token=""
+            if [[ -z "$token" ]]; then
+              # Surface Keycloak's error (never echoes the token); fall back
+              # to a body snippet for non-JSON responses (WAF page, maintenance).
+              detail=$(printf '%s' "$body" | jq -r \
+                '[.error // empty, .error_description // empty] | map(select(. != "")) | join(": ")' \
+                2>/dev/null) || detail=""
+              [[ -z "$detail" && -n "$body" ]] && detail=$(printf '%s' "$body" | tr -d '\r\n' | head -c 200)
+              echo "::error title=Auth Failed::Authentication failed for server $SERVER_ID: HTTP ${http_code:-none}${detail:+ - $detail} (check SCP_REFRESH_TOKEN: it dies if unused for 30 days or on revoke - regenerate per README)" >&2
+              return 1
+            fi
+            TOKEN="$token"
+            echo "::add-mask::$TOKEN"
+          }
+
+          # ── API Helper ─────────────────────────────────────────────────
+          api() {
+            local method=$1 endpoint=$2
+            shift 2
+            local retry=()
+            [[ "$method" == GET ]] && retry=(--retry 2 --retry-delay 2 --retry-all-errors)
+            local response http_code
+            response=$(curl -s "${retry[@]}" -w "\n%{http_code}" \
+              -X "$method" "$API_BASE$endpoint" \
+              -H "Authorization: Bearer $TOKEN" "$@")
+            http_code=$(echo "$response" | tail -n1)
+            response=$(echo "$response" | sed '$d')
+            if [[ ! "$http_code" =~ ^2[0-9]{2}$ ]]; then
+              local msg
+              msg=$(echo "$response" | jq -r '.message // empty' 2>/dev/null) || msg=""
+              if [[ "$http_code" == "409" || "$http_code" == "503" ]]; then
+                echo "  API $method $endpoint -> HTTP $http_code${msg:+ ($msg)} (transient, will retry)" >&2
+                return 2
+              fi
+              echo "::warning::API $method $endpoint -> HTTP $http_code${msg:+ ($msg)}" >&2
+              return 1
+            fi
+            echo "$response"
+          }
+
+          # ── Retry Through Transient Write Locks ────────────────────────
+          api_locked() {
+            local deadline=$((SECONDS + LOCK_RETRY_DEADLINE)) out rc
+            while :; do
+              rc=0; out=$(api "$@") || rc=$?
+              if (( rc == 0 )); then printf '%s\n' "$out"; return 0; fi
+              if (( rc == 2 )) && (( SECONDS < deadline )); then sleep "$LOCK_RETRY_INTERVAL"; continue; fi
+              return 1
+            done
+          }
+
+          # ── Wait for Task Completion ───────────────────────────────────
+          wait_task() {
+            local uuid=$1 max_attempts=${2:-$POLL_ATTEMPTS}
+            local body state msg poll_failures=0
+            for ((i = 1; i <= max_attempts; i++)); do
+              if (( i > 1 )) && (( i % REFRESH_EVERY == 0 )); then
+                refresh_token || echo "::warning::token refresh during wait failed (task $uuid)"
+              fi
+              body=$(api GET "/tasks/$uuid" 2>/dev/null) || body=""
+              state=$(echo "$body" | jq -r '.state // empty' 2>/dev/null) || state=""
+              case "$state" in
+                FINISHED) return 0 ;;
+                ERROR|CANCELED|WAITING_FOR_CANCEL|ROLLBACK)
+                  msg=$(echo "$body" | jq -r '.responseError.message // .message // empty' 2>/dev/null) || msg=""
+                  echo "::warning::Task $uuid ended with state: $state${msg:+ ($msg)}"; return 1 ;;
+                "")
+                  poll_failures=$((poll_failures + 1))
+                  if ((poll_failures >= 3)); then
+                    echo "::warning::Task $uuid state unavailable after $poll_failures consecutive polls"; return 1
+                  fi ;;
+                *) poll_failures=0 ;;
+              esac
+              sleep "$POLL_INTERVAL"
+            done
+            echo "::warning::Task $uuid timed out after $((max_attempts * POLL_INTERVAL))s (last state: ${state:-unknown})"
+            return 1
+          }
+
+          # ── Wait for Server State ──────────────────────────────────────
+          wait_for_state() {
+            local target=$1 state last_state="unknown"
+            for ((i = 1; i <= POLL_ATTEMPTS; i++)); do
+              state=$(api GET "/servers/$SERVER_ID" 2>/dev/null | jq -r '.serverLiveInfo.state // empty') || true
+              [[ -n "$state" ]] && last_state="$state"
+              [[ "$state" == "$target" ]] && return 0
+              sleep "$POLL_INTERVAL"
+            done
+            echo "::warning::Server $SERVER_ID did not reach $target (last seen: $last_state)"
+            return 1
+          }
+
+          # ── Ensure Server Stopped (SHUTOFF) ────────────────────────────
+          ensure_stopped() {
+            local state
+            state=$(api GET "/servers/$SERVER_ID" | jq -r '.serverLiveInfo.state // empty') || state=""
+            if [[ "$state" == "SHUTOFF" ]]; then echo "Server already stopped"; return 0; fi
+            echo "Stopping server (current: ${state:-unknown})..."
+            local task
+            task=$(api_locked PATCH "/servers/$SERVER_ID" \
+              -H "Content-Type: application/merge-patch+json" \
+              -d '{"state":"OFF"}' | jq -r '.uuid // empty') || task=""
+            [[ -n "$task" ]] && { wait_task "$task" "$POLL_ATTEMPTS" || true; }
+            if wait_for_state "SHUTOFF"; then echo "Server stopped"; return 0; fi
+            echo "::error title=Stop Failed::Server $SERVER_ID did not reach SHUTOFF within timeout"
+            return 1
+          }
+
+          # ── Prune Snapshots (count-based) ──────────────────────────────
+          prune_snapshots() {
+            local keep=$1
+            (( keep < 0 )) && keep=0
+            echo "Pruning snapshots, keeping newest $keep of ours..."
+            refresh_token || { echo "::warning::token refresh before prune failed; skipping prune"; return 0; }
+            local snapshots surplus
+            snapshots=$(api GET "/servers/$SERVER_ID/snapshots") || { echo "::warning::Could not list snapshots for prune"; return 0; }
+            surplus=$(echo "$snapshots" | jq -r --argjson keep "$keep" '
+              [ .[] | select(.name != null and .creationTime != null
+                             and (.name | test("^([0-9]{8}|[0-9]{4}-[0-9]{2}-[0-9]{2})$"))) ]
+              | sort_by(.creationTime) | reverse | .[$keep:] | .[].name
+            ') || surplus=""
+            local deleted=0
+            while IFS= read -r snap_name; do
+              [[ -z "$snap_name" ]] && continue
+              refresh_token || { echo "::warning::token refresh failed during prune; stopping"; break; }
+              echo "  Deleting snapshot: $snap_name"
+              local del_task
+              del_task=$(api_locked DELETE "/servers/$SERVER_ID/snapshots/$snap_name" | jq -r '.uuid // empty') || del_task=""
+              if [[ -n "$del_task" ]] && wait_task "$del_task" "$POLL_ATTEMPTS"; then
+                echo "  Deleted: $snap_name"; deleted=$((deleted + 1))
+              else
+                echo "::warning::Failed to delete snapshot: $snap_name"
+              fi
+            done <<< "$surplus"
+            echo "Prune complete ($deleted snapshot(s) deleted)"
+          }
+
+          # ── Dry-run: will an offline snapshot succeed? ─────────────────
+          snapshot_dryrun() {
+            DRYRUN_STATE="unknown"; DRYRUN_DETAIL=""
+            local body resp http
+            body=$(jq -nc --arg disk "$DISK_NAME" '{diskName: $disk, onlineSnapshot: false}')
+            resp=$(curl -s -w "\n%{http_code}" -X POST \
+              "$API_BASE/servers/$SERVER_ID/snapshots:dryrun" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$body") || resp=""
+            http=$(printf '%s' "$resp" | tail -n1)
+            resp=$(printf '%s' "$resp" | sed '$d')
+            if [[ "$http" == "200" ]]; then DRYRUN_STATE="possible"; return 0; fi
+            if [[ "$http" == "400" ]]; then
+              DRYRUN_DETAIL=$(printf '%s' "$resp" | jq -r '[.[].code] | join(" ")' 2>/dev/null) || DRYRUN_DETAIL=""
+              if grep -qE 'storagelimit|storageoptimization' <<< "$DRYRUN_DETAIL"; then
+                DRYRUN_STATE="needs_optimization"
+              else
+                DRYRUN_STATE="blocked"
+              fi
+              return 0
+            fi
+            DRYRUN_DETAIL="HTTP $http"   # 503 maintenance, 404, network, ...
+            return 0
+          }
+
+          # ── Storage Optimization (DELETES ALL SNAPSHOTS) ───────────────
+          run_storage_optimization() {
+            echo "::warning title=Storage Optimization::Optimizing storage on $SERVER_ID - this DELETES ALL SNAPSHOTS on the server (data/OS untouched)"
+            refresh_token || echo "::warning::token refresh before optimization failed; continuing"
+            local task
+            task=$(api_locked POST "/servers/$SERVER_ID/storageoptimization?startAfterOptimization=false" \
+              -H "Content-Type: application/json" \
+              | jq -r '.uuid // empty') || task=""
+            if [[ -z "$task" ]]; then
+              echo "::error title=Optimization Failed::Storage optimization did not start on $SERVER_ID"; return 1
+            fi
+            echo "Optimization task: $task (uncancellable; can take a few minutes)"
+            if wait_task "$task" "$OPT_POLL_ATTEMPTS"; then echo "Storage optimization finished"; return 0; fi
+            echo "::error title=Optimization Failed::Storage optimization did not finish in time on $SERVER_ID"; return 1
+          }
+
+          # ── Restart Server (called by trap on exit) ────────────────────
+          restart_server() {
+            $WAS_ONLINE || return 0
+            echo "Restarting server $SERVER_ID..."
+            refresh_token || echo "::warning::Token refresh failed during recovery; trying with existing token"
+            local attempt task
+            for ((attempt = 1; attempt <= RESTART_MAX_ATTEMPTS; attempt++)); do
+              echo "  Restart attempt $attempt/$RESTART_MAX_ATTEMPTS"
+              task=$(api_locked PATCH "/servers/$SERVER_ID" \
+                -H "Content-Type: application/merge-patch+json" \
+                -d '{"state":"ON"}' | jq -r '.uuid // empty') || task=""
+              [[ -n "$task" ]] && { wait_task "$task" "$POLL_ATTEMPTS" || true; }
+              if wait_for_state "RUNNING"; then echo "Server $SERVER_ID is online"; WAS_ONLINE=false; return 0; fi
+            done
+            echo "::error title=Server Offline::CRITICAL: Server $SERVER_ID not verified online - CHECK MANUALLY"
+            return 1
+          }
+
+          on_exit() {
+            local rc=$?
+            restart_server || rc=$?
+            echo "::endgroup::"
+            exit "$rc"
+          }
+          trap on_exit EXIT
+          trap 'exit 143' TERM INT
+
+          # ── Authenticate ───────────────────────────────────────────────
+          refresh_token || exit 1
+          echo "Authenticated"
+
+          # ── Resolve Disk Name ──────────────────────────────────────────
+          DISKS_RESPONSE=$(api GET "/servers/$SERVER_ID/disks")
+          DISK_NAME=$(echo "$DISKS_RESPONSE" | jq -r '.[0].name // empty')
+          DISK_COUNT=$(echo "$DISKS_RESPONSE" | jq 'length')
+          if [[ -z "$DISK_NAME" ]]; then
+            echo "::error title=Disk Unknown::Could not determine disk name for server $SERVER_ID"; exit 1
+          fi
+          [[ "$DISK_COUNT" -gt 1 ]] && echo "::warning::Server has $DISK_COUNT disks; only the first ($DISK_NAME) will be snapshotted"
+          echo "Disk: $DISK_NAME"
+
+          # ── Initial state (fixes the restart decision) ─────────────────
+          STATE=$(api GET "/servers/$SERVER_ID" | jq -r '.serverLiveInfo.state // empty')
+          if [[ -z "$STATE" ]]; then
+            echo "::error title=State Unknown::Could not determine server state for $SERVER_ID"; exit 1
+          fi
+          echo "Current state: $STATE"
+          [[ "$STATE" != "SHUTOFF" ]] && WAS_ONLINE=true
+
+          # ── Skip if today's snapshot already exists ────────────────────
+          SNAP_NAME="$(date -u +%Y%m%d)"
+          SNAPSHOTS=$(api GET "/servers/$SERVER_ID/snapshots") || {
+            echo "::error title=List Failed::Could not list snapshots for $SERVER_ID"; exit 1
+          }
+          if echo "$SNAPSHOTS" | jq -e --arg name "$SNAP_NAME" 'any(.[]; .name == $name)' >/dev/null; then
+            echo "Snapshot '$SNAP_NAME' already exists - skipping"; exit 0
+          fi
+
+          # ── Stop, prune, then ask netcup if a snapshot is possible ─────
+          ensure_stopped || exit 1
+          prune_snapshots "$((KEEP - 1))"   # keep newest KEEP-1; the new one makes KEEP
+
+          snapshot_dryrun
+          case "$DRYRUN_STATE" in
+            possible)
+              echo "Dry-run: snapshot is possible" ;;
+            needs_optimization)
+              echo "Dry-run: snapshot needs a storage optimization first (${DRYRUN_DETAIL})"
+              if [[ "$ENABLE_STORAGE_OPTIMIZATION" != "true" ]]; then
+                echo "::error title=Optimization Required::Storage optimization required but disabled (ENABLE_STORAGE_OPTIMIZATION=false)"; exit 1
+              fi
+              run_storage_optimization || exit 1
+              ensure_stopped || exit 1 ;;   # stays off (startAfterOptimization=false); verify anyway
+            blocked)
+              echo "::error title=Snapshot Blocked::Snapshot cannot be created for a non-space reason: ${DRYRUN_DETAIL}"; exit 1 ;;
+            *)
+              echo "::warning::Dry-run inconclusive (${DRYRUN_DETAIL}); attempting snapshot anyway (no optimization)" ;;
+          esac
+
+          # ── Create Snapshot ────────────────────────────────────────────
+          echo "Creating snapshot: $SNAP_NAME (disk: $DISK_NAME)"
+          refresh_token || echo "::warning::token refresh before snapshot failed; continuing"
+          SNAP_BODY=$(jq -nc --arg name "$SNAP_NAME" --arg disk "$DISK_NAME" \
+            '{name: $name, description: "Weekly Backup", diskName: $disk, onlineSnapshot: false}')
+          if ! SNAP_RESPONSE=$(api_locked POST "/servers/$SERVER_ID/snapshots" \
+            -H "Content-Type: application/json" -d "$SNAP_BODY"); then
+            echo "::error title=Snapshot Failed::Snapshot API call failed for server $SERVER_ID"; exit 1
+          fi
+          TASK=$(echo "$SNAP_RESPONSE" | jq -r '.uuid // empty')
+          if [[ -z "$TASK" ]]; then
+            echo "::error title=Snapshot Failed::No task UUID in snapshot response"; exit 1
+          fi
+          echo "Snapshot task: $TASK"
+          if wait_task "$TASK" "$SNAPSHOT_POLL_ATTEMPTS"; then
+            echo "Snapshot created: $SNAP_NAME"
+          else
+            echo "::error title=Snapshot Failed::Snapshot task did not complete for server $SERVER_ID"; exit 1
+          fi
+          readonly POLL_INTERVAL=5
+          readonly POLL_ATTEMPTS=12            # ~60s: state polls, stop/start, deletes
+          readonly SNAPSHOT_POLL_ATTEMPTS=24   # ~120s: snapshot creation (real-world ~1 min)
+          readonly OPT_POLL_ATTEMPTS=240       # ~1200s (20 min) SAFETY CEILING for optimization
+          readonly RESTART_MAX_ATTEMPTS=3
+          readonly LOCK_RETRY_INTERVAL=10      # backoff between transient (409/503) write retries
+          readonly LOCK_RETRY_DEADLINE=180     # max wait for a state-change lock / maintenance
+                                               # (< timeout-minutes so the restart trap always runs)
+          readonly TOKEN_REFRESH_SECS=240      # refresh access token during long waits (TTL ~300s)
+
+          # Snapshots to keep (count-based). Validate; fall back to 3.
+          KEEP="${SNAPSHOT_KEEP:-3}"
+          if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || (( KEEP < 1 )); then
+            echo "::warning::SNAPSHOT_KEEP='${SNAPSHOT_KEEP:-}' invalid; using 3"
+            KEEP=3
+          fi
+          readonly KEEP
+          readonly REFRESH_EVERY=$(( TOKEN_REFRESH_SECS / POLL_INTERVAL ))
+
+          WAS_ONLINE=false   # server was running at start => restart at end
+          TOKEN=""
+          DRYRUN_STATE=""    # set by snapshot_dryrun: possible|needs_optimization|blocked|unknown
+          DRYRUN_DETAIL=""
+
+          echo "::group::Server $SERVER_ID"
+
+          # ── Authentication ─────────────────────────────────────────────
           refresh_token() {
             local grant=() hint response http_code body token detail
             if [[ -n "${SCP_REFRESH_TOKEN:-}" ]]; then
