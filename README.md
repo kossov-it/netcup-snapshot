@@ -40,8 +40,6 @@ An `EXIT` trap (with `TERM`/`INT` routed in) always attempts a restart, even on 
 
 The offline token is reusable and never expires as long as it's used at least once every 30 days — the weekly schedule keeps it alive. If the workflow is disabled for longer, regenerate the token. Revoke a leaked token via the `…/openid-connect/revoke` endpoint or the SCP Account Console (Applications → scp → Remove access).
 
-*Legacy fallback:* if `SCP_REFRESH_TOKEN` is unset, the workflow falls back to `SCP_USER`/`SCP_PASS` as an OAuth2 password grant. netcup removed that flow from its docs and disabled it server-side around 2026-07-20 (all runs failed at authentication), so don't rely on it.
-
 **Variable** — one required: `SERVER_IDS`, a JSON array of strings like `["123456", "789012"]` (ID is in the SCP URL).
 
 **Schedule** (optional): edit the cron, default `0 4 * * 1`. Also runs manually from the Actions tab.
