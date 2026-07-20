@@ -22,6 +22,7 @@ jobs:
     steps:
       - name: Create offline snapshot
         env:
+          SCP_REFRESH_TOKEN: ${{ secrets.SCP_REFRESH_TOKEN }}
           SCP_USER: ${{ secrets.SCP_USER }}
           SCP_PASS: ${{ secrets.SCP_PASS }}
           SERVER_ID: ${{ matrix.server_id }}
@@ -60,20 +61,43 @@ jobs:
           echo "::group::Server $SERVER_ID"
 
           # ── Authentication ─────────────────────────────────────────────
-          # Keycloak password grant (the flow this account uses). Fields are
-          # URL-encoded so passwords with &, =, +, %, # or spaces are safe.
-          # (netcup also documents an offline refresh-token flow - see notes.)
+          # Preferred: exchange the long-lived offline refresh token for a
+          # short-lived access token (the only flow in netcup's current API
+          # docs; the offline token stays valid while used every <=30 days,
+          # which the weekly schedule guarantees). Fallback: the old
+          # password grant, which netcup dropped from the docs and appears
+          # to have disabled server-side around 2026-07-20 - kept only so
+          # existing setups fail with a clear pointer to the new secret.
+          # Fields are URL-encoded so tokens/passwords with special
+          # characters are safe.
           refresh_token() {
-            local response token
+            local grant=() hint response http_code body token detail
+            if [[ -n "${SCP_REFRESH_TOKEN:-}" ]]; then
+              grant=(--data-urlencode "grant_type=refresh_token"
+                     --data-urlencode "refresh_token=$SCP_REFRESH_TOKEN")
+              hint="check SCP_REFRESH_TOKEN: it expires if unused for 30 days and dies on revoke - regenerate per README"
+            else
+              grant=(--data-urlencode "grant_type=password"
+                     --data-urlencode "username=$SCP_USER"
+                     --data-urlencode "password=$SCP_PASS")
+              hint="password grant no longer documented by netcup - set the SCP_REFRESH_TOKEN secret (see README)"
+            fi
             response=$(curl -s --retry 3 --retry-delay 2 --retry-all-errors \
+              -w "\n%{http_code}" \
               -X POST "$AUTH_URL" \
               --data-urlencode "client_id=scp" \
-              --data-urlencode "grant_type=password" \
-              --data-urlencode "username=$SCP_USER" \
-              --data-urlencode "password=$SCP_PASS")
-            token=$(echo "$response" | jq -r '.access_token // empty' 2>/dev/null) || token=""
+              "${grant[@]}") || response=""
+            http_code=$(printf '%s' "$response" | tail -n1)
+            body=$(printf '%s' "$response" | sed '$d')
+            token=$(printf '%s' "$body" | jq -r '.access_token // empty' 2>/dev/null) || token=""
             if [[ -z "$token" ]]; then
-              echo "::error title=Auth Failed::Authentication failed for server $SERVER_ID (check SCP_USER/SCP_PASS)" >&2
+              # Surface Keycloak's error (never echoes credentials); fall back
+              # to a body snippet for non-JSON responses (WAF page, maintenance).
+              detail=$(printf '%s' "$body" | jq -r \
+                '[.error // empty, .error_description // empty] | map(select(. != "")) | join(": ")' \
+                2>/dev/null) || detail=""
+              [[ -z "$detail" && -n "$body" ]] && detail=$(printf '%s' "$body" | tr -d '\r\n' | head -c 200)
+              echo "::error title=Auth Failed::Authentication failed for server $SERVER_ID: HTTP ${http_code:-none}${detail:+ - $detail} ($hint)" >&2
               return 1
             fi
             TOKEN="$token"
