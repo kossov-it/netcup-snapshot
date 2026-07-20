@@ -18,7 +18,29 @@ An `EXIT` trap (with `TERM`/`INT` routed in) always attempts a restart, even on 
 
 ## Setup
 
-**Secrets** (`Settings → Secrets and variables → Actions`): `SCP_USER`, `SCP_PASS` — your SCP username and password. The workflow sends them as an OAuth2 password grant (`client_id=scp`, `grant_type=password`) to the SCP Keycloak token endpoint and uses the returned bearer token. No API key. (This is distinct from the CCP auto-login you use in a browser.)
+**Secret** (`Settings → Secrets and variables → Actions`): `SCP_REFRESH_TOKEN` — an offline refresh token, the auth flow in netcup's [REST API docs](https://www.netcup.com/en/helpcenter/documentation/server/rest-api). The workflow exchanges it for a short-lived bearer token (`client_id=scp`, `grant_type=refresh_token`) on every run. Generate it once:
+
+1. Request a device code:
+
+   ```bash
+   curl -X POST 'https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/auth/device' \
+     -d 'client_id=scp' -d 'scope=offline_access openid'
+   ```
+
+1. Open the returned `verification_uri_complete` in a browser, log in to SCP and approve the grant.
+1. Exchange the `device_code` for tokens (within `expires_in`, 10 min):
+
+   ```bash
+   curl -X POST 'https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token' \
+     -d 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
+     -d 'device_code=<device-code>' -d 'client_id=scp'
+   ```
+
+1. Store the `refresh_token` value from the response as the `SCP_REFRESH_TOKEN` secret.
+
+The offline token is reusable and never expires as long as it's used at least once every 30 days — the weekly schedule keeps it alive. If the workflow is disabled for longer, regenerate the token. Revoke a leaked token via the `…/openid-connect/revoke` endpoint or the SCP Account Console (Applications → scp → Remove access).
+
+*Legacy fallback:* if `SCP_REFRESH_TOKEN` is unset, the workflow falls back to `SCP_USER`/`SCP_PASS` as an OAuth2 password grant. netcup removed that flow from its docs and disabled it server-side around 2026-07-20 (all runs failed at authentication), so don't rely on it.
 
 **Variable** — one required: `SERVER_IDS`, a JSON array of strings like `["123456", "789012"]` (ID is in the SCP URL).
 
@@ -41,7 +63,7 @@ Everything else is a `readonly` constant in the workflow: `POLL_INTERVAL` 5 s, `
 - **No needless downtime** — skips if today’s snapshot exists; never powers on a server that was off.
 - **Cleanup keeps the newest `SNAPSHOT_KEEP`** dated (`YYYYMMDD`/`YYYY-MM-DD`) snapshots by `creationTime`; manual snapshots untouched.
 - **Destructive fallback is opt-out** — optimization wipes all snapshots, only on out-of-space + `ENABLE_STORAGE_OPTIMIZATION≠false`.
-- **Hardened** — encrypted secrets, masked tokens, URL-encoded auth, minimal logging, `permissions: {}`, no checkout. Only idempotent `GET`s retry at the transport layer.
+- **Hardened** — encrypted secrets, masked tokens, URL-encoded auth, minimal logging, `permissions: {}`, no checkout. Only idempotent `GET`s retry at the transport layer. Auth failures log Keycloak's HTTP status and error text, never credentials.
 
 ## License
 
